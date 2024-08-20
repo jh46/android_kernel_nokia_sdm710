@@ -210,7 +210,7 @@ static void geneve_rx(struct geneve_dev *geneve, struct geneve_sock *gs,
 	struct metadata_dst *tun_dst = NULL;
 	struct pcpu_sw_netstats *stats;
 	unsigned int len;
-	int err = 0;
+	int nh, err = 0;
 	void *oiph;
 
 	if (ip_tunnel_collect_metadata() || gs->collect_md) {
@@ -254,8 +254,22 @@ static void geneve_rx(struct geneve_dev *geneve, struct geneve_sock *gs,
 		goto drop;
 	}
 
-	oiph = skb_network_header(skb);
+	/* Save offset of outer header relative to skb->head,
+	 * because we are going to reset the network header to the inner header
+	 * and might change skb->head.
+	 */
+	nh = skb_network_header(skb) - skb->head;
+
 	skb_reset_network_header(skb);
+
+	if (!pskb_inet_may_pull(skb)) {
+		DEV_STATS_INC(geneve->dev, rx_length_errors);
+		DEV_STATS_INC(geneve->dev, rx_errors);
+		goto drop;
+	}
+
+	/* Get the outer header. */
+	oiph = skb->head + nh;
 
 	if (geneve_get_sk_family(gs) == AF_INET)
 		err = IP_ECN_decapsulate(oiph, skb);
@@ -732,7 +746,8 @@ free_dst:
 static struct rtable *geneve_get_v4_rt(struct sk_buff *skb,
 				       struct net_device *dev,
 				       struct flowi4 *fl4,
-				       struct ip_tunnel_info *info)
+				       struct ip_tunnel_info *info,
+				       __be16 dport, __be16 sport)
 {
 	bool use_cache = ip_tunnel_dst_cache_usable(skb, info);
 	struct geneve_dev *geneve = netdev_priv(dev);
@@ -746,6 +761,8 @@ static struct rtable *geneve_get_v4_rt(struct sk_buff *skb,
 	memset(fl4, 0, sizeof(*fl4));
 	fl4->flowi4_mark = skb->mark;
 	fl4->flowi4_proto = IPPROTO_UDP;
+	fl4->fl4_dport = dport;
+	fl4->fl4_sport = sport;
 
 	if (info) {
 		fl4->daddr = info->key.u.ipv4.dst;
@@ -791,7 +808,8 @@ static struct rtable *geneve_get_v4_rt(struct sk_buff *skb,
 static struct dst_entry *geneve_get_v6_dst(struct sk_buff *skb,
 					   struct net_device *dev,
 					   struct flowi6 *fl6,
-					   struct ip_tunnel_info *info)
+					   struct ip_tunnel_info *info,
+					   __be16 dport, __be16 sport)
 {
 	bool use_cache = ip_tunnel_dst_cache_usable(skb, info);
 	struct geneve_dev *geneve = netdev_priv(dev);
@@ -807,6 +825,8 @@ static struct dst_entry *geneve_get_v6_dst(struct sk_buff *skb,
 	memset(fl6, 0, sizeof(*fl6));
 	fl6->flowi6_mark = skb->mark;
 	fl6->flowi6_proto = IPPROTO_UDP;
+	fl6->fl6_dport = dport;
+	fl6->fl6_sport = sport;
 
 	if (info) {
 		fl6->daddr = info->key.u.ipv6.dst;
@@ -894,13 +914,14 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
 			goto tx_error;
 	}
 
-	rt = geneve_get_v4_rt(skb, dev, &fl4, info);
+	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+	rt = geneve_get_v4_rt(skb, dev, &fl4, info,
+			      geneve->dst_port, sport);
 	if (IS_ERR(rt)) {
 		err = PTR_ERR(rt);
 		goto tx_error;
 	}
 
-	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
 	skb_reset_mac_header(skb);
 
 	if (info) {
@@ -983,13 +1004,14 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
 		}
 	}
 
-	dst = geneve_get_v6_dst(skb, dev, &fl6, info);
+	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+	dst = geneve_get_v6_dst(skb, dev, &fl6, info,
+				geneve->dst_port, sport);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto tx_error;
 	}
 
-	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
 	skb_reset_mac_header(skb);
 
 	if (info) {
@@ -1114,9 +1136,14 @@ static int geneve_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 	struct dst_entry *dst;
 	struct flowi6 fl6;
 #endif
+	__be16 sport;
 
 	if (ip_tunnel_info_af(info) == AF_INET) {
-		rt = geneve_get_v4_rt(skb, dev, &fl4, info);
+		sport = udp_flow_src_port(geneve->net, skb,
+					  1, USHRT_MAX, true);
+
+		rt = geneve_get_v4_rt(skb, dev, &fl4, info,
+				      geneve->dst_port, sport);
 		if (IS_ERR(rt))
 			return PTR_ERR(rt);
 
@@ -1124,7 +1151,11 @@ static int geneve_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 		info->key.u.ipv4.src = fl4.saddr;
 #if IS_ENABLED(CONFIG_IPV6)
 	} else if (ip_tunnel_info_af(info) == AF_INET6) {
-		dst = geneve_get_v6_dst(skb, dev, &fl6, info);
+		sport = udp_flow_src_port(geneve->net, skb,
+					  1, USHRT_MAX, true);
+
+		dst = geneve_get_v6_dst(skb, dev, &fl6, info,
+					geneve->dst_port, sport);
 		if (IS_ERR(dst))
 			return PTR_ERR(dst);
 
@@ -1135,8 +1166,7 @@ static int geneve_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 		return -EINVAL;
 	}
 
-	info->key.tp_src = udp_flow_src_port(geneve->net, skb,
-					     1, USHRT_MAX, true);
+	info->key.tp_src = sport;
 	info->key.tp_dst = geneve->dst_port;
 	return 0;
 }
